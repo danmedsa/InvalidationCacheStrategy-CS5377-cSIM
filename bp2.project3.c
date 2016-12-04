@@ -45,11 +45,13 @@ struct q_msg {
     double data;
 };
 
-typedef struct DataItem *IR;
+typedef struct DataItem IR;
+//typedef struct DataItem Update;
 
 struct DataItem{
     int data;
     double timeStamp;
+    char type;
 };
 
 typedef struct Cache Cache;
@@ -101,9 +103,9 @@ void server_listener();
 void server_timer_trigger();
 void check_cache(long, int);
 double check_db_item_timeStamp(int);
-void add_to_IR(int, double);
+void add_to_IR(int, double,int);
 void add_to_updates(int, double);
-void add_to_cache(int, int, double);
+void add_to_cache(int, int, double, int);
 
 
 EVENT trigger_IR;
@@ -112,11 +114,10 @@ EVENT IR_timer;
 EVENT prepare_msg;
 EVENT update_ev;
 EVENT client_query;
-//EVENT writing;
+EVENT wait_read;
+EVENT update_read;
 
-IR IR_msg;
-IR IR_start;
-
+IR *IR_msg;
 
 int IR_size;
 
@@ -128,7 +129,9 @@ void sim() {
     prepare_msg = event("Prepare_Msg");
     update_ev = event("Update_Ev");
     client_query = event("Client Query");
-//    writing = event("Writing to IR");
+    wait_read = event("Waiting to read IR");
+    update_read = event("Waiting Update read");
+
     init();
     hold(SIM_TIME);
     report();
@@ -141,16 +144,13 @@ void init() {
     max_facilities((NUM_NODES + NUM_SERVERS) * (NUM_NODES + NUM_SERVERS + NUM_NODES + NUM_SERVERS));
     max_servers((NUM_NODES + NUM_SERVERS) * (NUM_NODES + NUM_SERVERS) + (NUM_NODES + NUM_SERVERS));
     max_mailboxes((NUM_NODES + NUM_SERVERS));
-    max_events(2 * (NUM_NODES + NUM_SERVERS) * (NUM_NODES + NUM_SERVERS));
+    max_events(2 * (NUM_NODES + NUM_SERVERS) * (NUM_NODES + NUM_SERVERS) + 2);
 
     resp_tm = table("msg rsp tm");
     msg_queue = NIL;
     query_queue = NIL;
 
-
-    IR_msg = malloc(sizeof(struct DataItem)*DB_DATA_ITEMS); //Alloc Queried Items MAX SIZE 1000
-    IR_start = IR_msg;
-
+    IR_msg = malloc(sizeof(IR)*DB_DATA_ITEMS); //Alloc Queried Items MAX SIZE 1000
     IR_size = 0;
 
 
@@ -187,13 +187,8 @@ void init() {
 }
 
 void clients(int i){
-//    static double new_cache[3*CACHE_SIZE] = {0};
     int n;
-//    printf("Initial Cache:\n");
-//    for(n = 0; n < CACHE_SIZE; n++){
-//        printf("%.0lf - %.2lf - %.0lf | ", new_cache[n], new_cache[n+1], new_cache[n+2]);
-//    }
-//    printf("\n");
+
     nodes[i].cache = malloc(sizeof(Cache)* CACHE_SIZE);
     for(n = 0; n < CACHE_SIZE; n++){
         printf("%.0lf - %.2lf - %.0lf | ", nodes[i].cache[n].data, nodes[i].cache[n].timeStamp, nodes[i].cache[n].validity);
@@ -216,7 +211,6 @@ void server(){
     printf("-------Wait Setup --------\n");
 
     wait(setup);
-    //update_server_data(s_nodes[0].db);        //TODO: Update DB Items
     update_server_data();
     server_timer_trigger();
     server_listener();
@@ -239,24 +233,31 @@ void server_timer_trigger(){
         }
         printf("-------Set Trigger IR --------\n");
         set(trigger_IR);
+
         for(n = 0; n < 100; n++){
-            printf("%d - %.2lf",IR_msg[n].data, IR_msg[n].timeStamp);
+            printf("%d - %.2lf | ",IR_msg[n].data, IR_msg[n].timeStamp);
         }
-        IR_msg +- IR_size;
-        IR_size = 0;
+        printf("\n");
+
+        wait(wait_read);
+        IR_msg[0].data = -1;
+        IR_msg[0].timeStamp = -1;
+        n = 1;
+        while(IR_msg[n].data != -1 && n < DB_DATA_ITEMS){
+            IR_msg[n].data = 0;
+            IR_msg[n].timeStamp = 0;
+            n++;
+        }
+
     }
 }
 
 void server_listener(){
     q_msg_t msg;
     long type;
-//    IR data;
-//    data.data = -1;
-//    data.timeStamp = -1.0;
-//    IR_msg[0] = data;
 
-    IR_msg->data = -1;
-    IR_msg->timeStamp = -1.0;
+    IR_msg[0].data = -1;
+    IR_msg[0].timeStamp = -1.0;
 
     create("Server Listener");
     printf("Server Listener Initialized\n");
@@ -274,9 +275,7 @@ void server_listener(){
         type = msg->type;
         // Add data to IR
         double stamp = check_db_item_timeStamp(msg->data);
-        add_to_IR(msg->data,stamp);
-
-
+        add_to_IR(msg->data,stamp, 0);
     }
 }
 
@@ -285,7 +284,10 @@ void proc(long n) {
     msg_t msg;
     long s, type;
 
-    create("proc");
+    printf("Update Message Initialized\n");
+
+
+    create("Client Listener");
     while(clock < SIM_TIME) {
         printf("-------Wait Trigger IR --------\n");
         wait(trigger_IR);
@@ -297,7 +299,6 @@ void proc(long n) {
         clear(prepare_msg);
 
         read_ir("client received IR", msg, n);
-        //TODO read_updates("client received Updates", msg, n);
 
         type = msg->type;
         printf("------- Reset Trigger IR --------\n");
@@ -312,7 +313,6 @@ void query_manager(int i){
     printf("Query Manager Initialized\n");
     while (clock < SIM_TIME) {
         //Respond Query
-//	wait(IR_timer);
         double wait_t = exponential(QUERY_MEAN);
         hold(wait_t);
         printf("Query Triggered - %.2lf\n", wait_t);
@@ -414,14 +414,27 @@ msg_t new_msg(long to) {
 void gen_query(long client, int data_item){
     create("Query Generation");
     // New Query MSG
-    q_msg_t msg = new_query_msg(client, data_item);
-    printf("Query Message Created from: %ld ",msg->from);
-    printf("to: %ld ", msg->to);
-    printf("With Data: %.2lf\n", msg->data);
-    send_query_msg(msg);
-    printf("-------Set Client Query --------\n");
+    int found = 0;
+    int i;
+    for (i = 0; i < CACHE_SIZE; i++){
+        if(nodes[client].cache[i].data == data_item){
+            found = 1;
+            printf("--------- QUERY %d RESPONDED  --------", data_item);
+        }
+    }
 
-    set(client_query);
+    if(found == 0){
+        q_msg_t msg = new_query_msg(client, data_item);
+        printf("Query Message Created from: %ld ",msg->from);
+        printf("to: %ld ", msg->to);
+        printf("With Data: %.2lf\n", msg->data);
+        send_query_msg(msg);
+        printf("-------Set Client Query --------\n");
+
+        set(client_query);
+    }
+
+
     terminate();
 }
 
@@ -461,7 +474,6 @@ void send_query_msg(q_msg_t msg) {
     reserve(network[to][from]);
     hold(TRANS_TIME);
 
-//    send(s_nodes[0].input, msg);
     send(nodes[to].input, msg);
    release(network[to][from]);
 }
@@ -470,66 +482,45 @@ double check_db_item_timeStamp(int data){
     return s_nodes[0].db[data];
 }
 
-void add_to_IR(int data, double timeStamp){
+void add_to_IR(int data, double timeStamp, int type){
     create("addToIR");
-    //int i = 0;
-    while(IR_msg->timeStamp != -1.0){
-        //i++;
-        IR_msg++;
+    int i = 0;
+    while(IR_msg[i].timeStamp != -1.0){
+        i++;
     }
 
     printf("DataItem: %d -", data);
-    printf("TimeStamp: %.2lf\n", timeStamp);
+    printf("TimeStamp: %.2lf - ", timeStamp);
+    //printf("Update Type: %s\n", type);
 
 
-    IR_msg->data = data;
-    IR_msg->timeStamp = timeStamp;
-    IR_size++;
+    IR_msg[i].data = data;
+    IR_msg[i].timeStamp = timeStamp;
+    IR_msg[i].type = type;
 
-    IR_msg++;
-    IR_msg->data = -1;
-    IR_msg->timeStamp = -1.0;
-    IR_msg--;
+    if(i < DB_DATA_ITEMS){
+        IR_msg[i+1].data = -1;
+        IR_msg[i+1].timeStamp = -1.0;
+    }else{
+        printf("WARNING: IR MSG IS FULL\n");
+    }
 
     terminate();
 }
 
-//void add_to_updates(int data, double timeStamp){
-//    create("addToUpdates");
-//    //int i = 0;
-//    while(update_msg->timeStamp != -1.0){
-//        //i++;
-//        update_msg++;
-//    }
-//
-//    printf("DataItem: %d -", data);
-//    printf("TimeStamp: %.2lf\n", timeStamp);
-//
-//
-//    //update_msg->data = data;
-//    //update_msg->timeStamp = timeStamp;
-//    //update_msg++;
-//
-//    update_msg++;
-//    update_msg->data = -1;
-//    update_msg->timeStamp = -1.0;
-//    update_msg--;
-//
-//    terminate();
-//}
 
-void add_to_cache(int client, int data, double timeStamp){
-    int i;
+void add_to_cache(int client, int data, double timeStamp, int validity){
+    int i = 0;
     while(nodes[client].cache[i].data != 0){
         if(nodes[client].cache[i].data == data){
             nodes[client].cache[i].timeStamp = timeStamp;
-            nodes[client].cache[i].validity = 1;
+//            nodes[client].cache[i].validity = validity;
         }
         i++;
     }
     nodes[client].cache[i].data = data;
     nodes[client].cache[i].timeStamp = timeStamp;
-    nodes[client].cache[i].validity = 0;
+    nodes[client].cache[i].validity = validity;
 }
 
 // Logs all messages
@@ -538,44 +529,26 @@ void read_ir(char* str, msg_t msg, long n) {
            clock, n, str, (msg->type == REQUEST) ? "req" : "rep", msg->from);
 
 
-    IR_msg = IR_msg - IR_size;
-    //printf("IR MSG SIZE: %d\n",);
-    while(IR_msg->data != -1){
-        printf("-  Data: %.2lf ",IR_msg->data);
-        printf("Data item: %.0lf\n", IR_msg->timeStamp);
+    int i = 0;
+    while(IR_msg[i].data != -1){
+        printf("-  Data: %.2lf ",IR_msg[i].data);
+        printf("Data item: %.0lf\n", IR_msg[i].timeStamp);
         int n;
         for(n = 0; n < NUM_NODES; n++) {
-            int k;
             printf("--Cache: \n| ");
-            add_to_cache(n,IR_msg->data,IR_msg->timeStamp);
+            add_to_cache(n,IR_msg[i].data,IR_msg[i].timeStamp, IR_msg[i].type);
 
-            for (k = 0; k < CACHE_SIZE; k++) {
-                printf("%d - %.2lf - %d | ", nodes[n].cache[k].data, nodes[n].cache[k].timeStamp, nodes[n].cache[k].validity);
-            }
         }
-        IR_msg++;
-
+        i++;
     }
-
-    printf("\n");
-}
-
-// Logs all messages
-void read_updates(char* str, msg_t msg, long n) {
-    printf("%6.3f client %2ld: %s - IR: type = %s, from = Server, to = %ld -- Update Report\n",
-           clock, n, str, (msg->type == REQUEST) ? "req" : "rep", msg->from);
-
-    int i;
-
-    //Updates traverse = update_start;
-
-    for (i = 0; i < IR_size; ++i) {
-    //    printf("-  Data: %.2lf ",traverse->data);
-    //    printf("Data item: %.0lf ", traverse->timeStamp);
-    //    traverse++;
+    int k;
+    for (k = 0; k < CACHE_SIZE; k++) {
+        printf("%d - %.2lf - %d | ", nodes[n].cache[k].data, nodes[n].cache[k].timeStamp, nodes[n].cache[k].validity);
     }
-
     printf("\n");
+
+    set(wait_read);
+    clear(wait_read);
 }
 
 
@@ -591,7 +564,6 @@ void update_server_data() {
     create("Update Server Values");
     printf("Update Server Data - Initialized\n");
 
-
     while (clock < SIM_TIME) {
         // Update Values in Server
         printf("------- Wait UPDATE TIME and Trigger --------\n");
@@ -601,14 +573,16 @@ void update_server_data() {
             int data = rand() % 50;
             s_nodes[0].db[data] = clock;
             printf("Hot Data Item Update - Item %d - %.2f\n",data,clock);
-            add_to_IR(data,clock);
+
+            add_to_IR(data,s_nodes[0].db[data], 1);
 
         }else{                      // Update Cold Data Items 67%
             int data = rand() % 950 + 50;
             s_nodes[0].db[data] = clock;
-            add_to_IR(data,clock);
+
+            add_to_IR(data,s_nodes[0].db[data], 1);
+
             printf("Cold Data Item Update - Item %d - %.2f\n",data,clock);
         }
-
     }
 }
